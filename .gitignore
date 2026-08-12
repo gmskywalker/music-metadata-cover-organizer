@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+.build/
+build/
+dist/
+音乐整理工具数据/
+portable/音乐整理工具数据/
+*.log
+
