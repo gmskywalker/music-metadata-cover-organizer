@@ -70,18 +70,50 @@ from mutagen.mp4 import MP4, MP4Cover  # noqa: E402
 
 
 USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "CodexPersonalMusicLibrary/2.0"
+    "MusicMetadataCoverOrganizer/3.0 "
+    "(https://github.com/gmskywalker/music-metadata-cover-organizer)"
 )
 CORE_FIELDS = ("TITLE", "ARTIST", "ALBUM", "ALBUMARTIST", "YEAR", "DATE")
 DATE_RE = re.compile(r"^(?:19|20)\d{2}(?:-\d{2}(?:-\d{2})?)?$")
 IMAGE_MIME = {"JPEG": "image/jpeg", "PNG": "image/png"}
 CATALOG_CACHE_VERSION = "2"
+TRACK_CATALOG_CACHE_VERSION = "1"
 ARTIST_PHOTO_CACHE_VERSION = "3"
 ProgressCallback = Callable[[str, int, int, str], None]
 _REQUEST_LOCK = threading.Lock()
 _LAST_REQUEST: dict[str, float] = {}
 _PROVIDER_BLOCKED_UNTIL: dict[str, float] = {}
+
+
+def valid_release_date(value: str) -> bool:
+    value = (value or "").strip()
+    if not DATE_RE.fullmatch(value):
+        return False
+    try:
+        if len(value) == 4:
+            return True
+        if len(value) == 7:
+            datetime.strptime(value, "%Y-%m")
+        else:
+            datetime.strptime(value, "%Y-%m-%d")
+        return True
+    except ValueError:
+        return False
+
+
+def normalize_metadata_dates(metadata: dict[str, str]) -> dict[str, str]:
+    result = {field: str(metadata.get(field) or "").strip() for field in CORE_FIELDS}
+    if result["YEAR"] and not re.fullmatch(r"(?:19|20)\d{2}", result["YEAR"]):
+        raise ValueError("年份必须是 YYYY 格式")
+    if result["DATE"] and not valid_release_date(result["DATE"]):
+        raise ValueError("日期必须是有效的 YYYY、YYYY-MM 或 YYYY-MM-DD")
+    if result["DATE"] and not result["YEAR"]:
+        result["YEAR"] = result["DATE"][:4]
+    if result["YEAR"] and not result["DATE"]:
+        result["DATE"] = result["YEAR"]
+    if result["YEAR"] and result["DATE"] and result["YEAR"] != result["DATE"][:4]:
+        raise ValueError("年份必须与日期的年份一致")
+    return result
 
 
 SPECIAL_METADATA = {
@@ -510,7 +542,14 @@ def read_metadata(path: Path, audio: Any) -> dict[str, str]:
         }
     else:
         result = {field: "" for field in CORE_FIELDS}
-    return {field: (result.get(field) or "").strip() for field in CORE_FIELDS}
+    result = {field: (result.get(field) or "").strip() for field in CORE_FIELDS}
+    if valid_release_date(result["YEAR"]) and len(result["YEAR"]) > 4:
+        if not result["DATE"]:
+            result["DATE"] = result["YEAR"]
+        result["YEAR"] = result["YEAR"][:4]
+    if valid_release_date(result["DATE"]) and not result["YEAR"]:
+        result["YEAR"] = result["DATE"][:4]
+    return result
 
 
 def read_cover(path: Path, audio: Any) -> tuple[bytes | None, str | None, int]:
@@ -613,7 +652,7 @@ def initial_target_metadata(track: dict[str, Any], reviewed: dict[str, dict[str,
         current["ALBUMARTIST"] = current["ARTIST"]
     if current["ARTIST"]:
         current["ALBUMARTIST"] = current["ARTIST"]
-    if not current["YEAR"] and DATE_RE.match(current["DATE"] or ""):
+    if not current["YEAR"] and valid_release_date(current["DATE"] or ""):
         current["YEAR"] = current["DATE"][:4]
     if not current["DATE"] and re.fullmatch(r"(?:19|20)\d{2}", current["YEAR"] or ""):
         current["DATE"] = current["YEAR"]
@@ -625,6 +664,8 @@ def request_bytes(url: str, attempts: int = 3, timeout: int = 25) -> bytes:
     for attempt in range(attempts):
         if "itunes.apple.com" in url:
             bucket, interval = "apple-api", 0.45
+        elif "musicbrainz.org" in url:
+            bucket, interval = "musicbrainz-api", 1.10
         elif "music.163.com" in url:
             bucket, interval = "netease-api", 0.20
         elif "c.y.qq.com" in url:
@@ -645,8 +686,10 @@ def request_bytes(url: str, attempts: int = 3, timeout: int = 25) -> bytes:
                 "User-Agent": USER_AGENT,
                 "Accept": "application/json,image/avif,image/webp,image/apng,image/*,*/*",
                 "Referer": (
-                    "https://music.apple.com/"
-                    if "mzstatic.com" in url
+                    "https://musicbrainz.org/"
+                    if "musicbrainz.org" in url
+                    else "https://music.apple.com/"
+                    if "apple.com" in url or "mzstatic.com" in url
                     else "https://y.qq.com/"
                     if "gtimg.cn" in url or "y.qq.com" in url
                     else "https://music.163.com/"
@@ -728,6 +771,190 @@ def album_candidate_score(artist: str, album: str, candidate: dict[str, Any]) ->
     }:
         total = max(total, 0.90)
     return total, album_score, artist_score
+
+
+def duration_similarity(expected_ms: int | None, actual_ms: int | None) -> float:
+    if not expected_ms or not actual_ms:
+        return 0.5
+    difference = abs(expected_ms - actual_ms)
+    if difference <= 3000:
+        return 1.0
+    if difference <= 7000:
+        return 0.85
+    if difference <= 15000:
+        return 0.55
+    if difference <= 30000:
+        return 0.25
+    return 0.0
+
+
+def track_candidate_score(
+    metadata: dict[str, str], duration_ms: int | None, candidate: dict[str, Any]
+) -> tuple[float, float, float, float, float]:
+    expected_title = metadata.get("TITLE") or ""
+    actual_title = candidate.get("title") or ""
+    title_score = similarity(
+        title_without_version(expected_title), title_without_version(actual_title)
+    )
+    artist_score = artist_similarity(
+        metadata.get("ARTIST") or "", candidate.get("artist") or ""
+    )
+    album_score = similarity(
+        metadata.get("ALBUM") or "", candidate.get("album") or ""
+    )
+    duration_score = duration_similarity(duration_ms, candidate.get("duration_ms"))
+    expected_live = bool(re.search(r"live|现场|演唱会", expected_title, re.I))
+    actual_live = bool(re.search(r"live|现场|演唱会", actual_title, re.I))
+    version_score = 1.0 if expected_live == actual_live else 0.0
+    total = (
+        title_score * 0.38
+        + artist_score * 0.30
+        + album_score * 0.17
+        + duration_score * 0.10
+        + version_score * 0.05
+    )
+    return total, title_score, artist_score, album_score, duration_score
+
+
+def accepted_track_candidate(candidate: dict[str, Any]) -> bool:
+    if not candidate.get("release_date") or not valid_release_date(candidate["release_date"]):
+        return False
+    if candidate.get("title_similarity", 0.0) < 0.90:
+        return False
+    if candidate.get("artist_similarity", 0.0) < 0.88:
+        return False
+    if candidate.get("duration_similarity", 0.0) < 0.50:
+        return False
+    if (
+        candidate.get("date_scope") == "current-release"
+        and candidate.get("album_similarity", 0.0) < 0.60
+    ):
+        return False
+    return candidate.get("score", 0.0) >= 0.82
+
+
+def search_apple_track(
+    metadata: dict[str, str], duration_ms: int | None
+) -> list[dict[str, Any]]:
+    if not metadata.get("TITLE") or not metadata.get("ARTIST"):
+        return []
+    candidates = []
+    for country in ("HK", "TW"):
+        query = urllib.parse.urlencode(
+            {
+                "term": f"{metadata['ARTIST']} {metadata['TITLE']}",
+                "entity": "song",
+                "media": "music",
+                "country": country,
+                "limit": 50,
+            }
+        )
+        try:
+            payload = request_json(f"https://itunes.apple.com/search?{query}")
+        except Exception:
+            continue
+        for item in payload.get("results", []) or []:
+            candidate = {
+                "provider": f"apple-track-{country.lower()}",
+                "id": item.get("trackId"),
+                "title": item.get("trackName") or "",
+                "artist": item.get("artistName") or "",
+                "album": item.get("collectionName") or "",
+                "release_date": (item.get("releaseDate") or "")[:10] or None,
+                "duration_ms": item.get("trackTimeMillis"),
+                "catalog_url": item.get("trackViewUrl"),
+                "date_scope": "current-release",
+            }
+            total, title_score, artist_score, album_score, duration_score = (
+                track_candidate_score(metadata, duration_ms, candidate)
+            )
+            candidate.update(
+                {
+                    "score": total,
+                    "title_similarity": title_score,
+                    "artist_similarity": artist_score,
+                    "album_similarity": album_score,
+                    "duration_similarity": duration_score,
+                }
+            )
+            if accepted_track_candidate(candidate):
+                candidates.append(candidate)
+    return candidates
+
+
+def search_musicbrainz_track(
+    metadata: dict[str, str], duration_ms: int | None
+) -> list[dict[str, Any]]:
+    if not metadata.get("TITLE") or not metadata.get("ARTIST"):
+        return []
+    query_text = (
+        f'recording:"{metadata["TITLE"]}" AND artist:"{metadata["ARTIST"]}"'
+    )
+    query = urllib.parse.urlencode({"query": query_text, "fmt": "json", "limit": 50})
+    try:
+        payload = request_json(f"https://musicbrainz.org/ws/2/recording/?{query}")
+    except Exception:
+        return []
+    candidates = []
+    for item in payload.get("recordings", []) or []:
+        artist = " / ".join(
+            str(credit.get("name") or (credit.get("artist") or {}).get("name") or "")
+            for credit in item.get("artist-credit", []) or []
+            if isinstance(credit, dict)
+        )
+        releases = item.get("releases", []) or []
+        release_options = []
+        for release in releases:
+            release_date = str(release.get("date") or "")
+            if not valid_release_date(release_date):
+                continue
+            release_options.append(
+                (
+                    similarity(metadata.get("ALBUM") or "", release.get("title") or ""),
+                    release,
+                )
+            )
+        best_release = max(release_options, default=(0.0, None), key=lambda pair: pair[0])
+        album_score, release = best_release
+        release_date = str((release or {}).get("date") or "")
+        date_scope = "current-release"
+        album = str((release or {}).get("title") or "")
+        if album_score < 0.60 or not valid_release_date(release_date):
+            release_date = str(item.get("first-release-date") or "")
+            date_scope = "recording-first-release"
+            album = ""
+        candidate = {
+            "provider": "musicbrainz-recording",
+            "id": item.get("id"),
+            "title": item.get("title") or "",
+            "artist": artist,
+            "album": album,
+            "release_date": release_date or None,
+            "duration_ms": item.get("length"),
+            "catalog_url": (
+                f"https://musicbrainz.org/recording/{item.get('id')}"
+                if item.get("id")
+                else None
+            ),
+            "date_scope": date_scope,
+        }
+        total, title_score, artist_score, measured_album_score, duration_score = (
+            track_candidate_score(metadata, duration_ms, candidate)
+        )
+        candidate.update(
+            {
+                "score": total,
+                "title_similarity": title_score,
+                "artist_similarity": artist_score,
+                "album_similarity": measured_album_score,
+                "duration_similarity": duration_score,
+            }
+        )
+        if date_scope == "recording-first-release":
+            candidate["score"] += 0.04
+        if accepted_track_candidate(candidate):
+            candidates.append(candidate)
+    return candidates
 
 
 def search_apple_album(artist: str, album: str) -> dict[str, Any] | None:
@@ -1293,6 +1520,119 @@ def resolve_catalogs(
     return results
 
 
+def track_catalog_cache_path(metadata: dict[str, str], duration_ms: int | None) -> Path:
+    key = "|".join(
+        (
+            normalized(metadata.get("ARTIST") or ""),
+            normalized(metadata.get("TITLE") or ""),
+            str(round((duration_ms or 0) / 1000)),
+        )
+    )
+    digest = hashlib.sha256(
+        f"{TRACK_CATALOG_CACHE_VERSION}|{key}".encode("utf-8")
+    ).hexdigest()
+    return CACHE_DIR / "曲目目录" / f"{digest}.json"
+
+
+def load_track_catalog_cache(
+    metadata: dict[str, str], duration_ms: int | None
+) -> dict[str, Any] | None:
+    path = track_catalog_cache_path(metadata, duration_ms)
+    if not path.exists():
+        return None
+    try:
+        candidate = json.loads(path.read_text(encoding="utf-8")).get("candidate") or {}
+        total, title_score, artist_score, album_score, duration_score = (
+            track_candidate_score(metadata, duration_ms, candidate)
+        )
+        candidate.update(
+            {
+                "score": total,
+                "title_similarity": title_score,
+                "artist_similarity": artist_score,
+                "album_similarity": album_score,
+                "duration_similarity": duration_score,
+                "from_cache": True,
+            }
+        )
+        return candidate if accepted_track_candidate(candidate) else None
+    except Exception:
+        return None
+
+
+def resolve_track_catalogs(
+    plans: list[dict[str, Any]],
+    catalogs: dict[str, dict[str, Any] | None],
+    workers: int,
+    progress: ProgressCallback | None = None,
+) -> dict[str, dict[str, Any] | None]:
+    unresolved = [
+        plan
+        for plan in plans
+        if not plan["target_metadata"].get("DATE")
+        and not valid_release_date(
+            (catalogs.get(album_key(plan["target_metadata"])) or {}).get(
+                "release_date"
+            )
+            or ""
+        )
+        and plan["target_metadata"].get("TITLE")
+        and plan["target_metadata"].get("ARTIST")
+    ]
+    print(f"唱片集日期仍缺失，正在按曲名核对 {len(unresolved)} 首……", flush=True)
+
+    def resolve_one(plan: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+        metadata = plan["target_metadata"]
+        duration_ms = plan.get("duration_ms")
+        candidate = load_track_catalog_cache(metadata, duration_ms)
+        if candidate is None:
+            candidates = search_apple_track(metadata, duration_ms)
+            candidates.extend(search_musicbrainz_track(metadata, duration_ms))
+            candidate = max(
+                candidates,
+                default=None,
+                key=lambda item: (
+                    (
+                        2
+                        if item.get("date_scope") == "current-release"
+                        and item.get("album_similarity", 0.0) >= 0.80
+                        else 1
+                        if item.get("date_scope") == "recording-first-release"
+                        else 0
+                    ),
+                    item.get("album_similarity", 0.0),
+                    item.get("score", 0.0),
+                    len(item.get("release_date") or ""),
+                ),
+            )
+        if candidate is not None:
+            json_write(
+                track_catalog_cache_path(metadata, duration_ms),
+                {
+                    "cached_at": now_iso(),
+                    "query_artist": metadata["ARTIST"],
+                    "query_title": metadata["TITLE"],
+                    "duration_ms": duration_ms,
+                    "candidate": candidate,
+                },
+            )
+        return str(plan["path"]), candidate
+
+    results: dict[str, dict[str, Any] | None] = {}
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, 4))) as executor:
+        futures = {executor.submit(resolve_one, plan): plan for plan in unresolved}
+        for completed, future in enumerate(as_completed(futures), 1):
+            plan = futures[future]
+            try:
+                path_text, candidate = future.result()
+                results[path_text] = candidate
+            except Exception:
+                results[str(plan["path"])] = None
+            if progress:
+                progress("track_catalog", completed, len(futures), plan["filename"])
+    return results
+
+
 def normalize_cover_image(data: bytes) -> tuple[bytes, dict[str, Any]]:
     with Image.open(io.BytesIO(data)) as image:
         image.load()
@@ -1477,16 +1817,26 @@ def delete_casefold(tags: Any, *names: str) -> None:
             del tags[key]
 
 
-def write_flac(path: Path, metadata: dict[str, str], cover: bytes | None) -> None:
+def write_flac(
+    path: Path,
+    metadata: dict[str, str],
+    cover: bytes | None,
+    changed_fields: set[str],
+) -> None:
     audio = FLAC(path)
-    for key in ("title", "artist", "album", "albumartist", "year", "date"):
+    keys = {
+        "TITLE": "title",
+        "ARTIST": "artist",
+        "ALBUM": "album",
+        "ALBUMARTIST": "albumartist",
+        "YEAR": "year",
+        "DATE": "date",
+    }
+    for field in changed_fields:
+        key = keys[field]
         delete_casefold(audio.tags, key)
-    audio.tags["title"] = [metadata["TITLE"]]
-    audio.tags["artist"] = [metadata["ARTIST"]]
-    audio.tags["album"] = [metadata["ALBUM"]]
-    audio.tags["albumartist"] = [metadata["ALBUMARTIST"]]
-    audio.tags["year"] = [metadata["YEAR"]]
-    audio.tags["date"] = [metadata["DATE"]]
+        if metadata[field]:
+            audio.tags[key] = [metadata[field]]
     if cover is not None:
         audio.clear_pictures()
         picture = Picture()
@@ -1501,17 +1851,28 @@ def write_flac(path: Path, metadata: dict[str, str], cover: bytes | None) -> Non
     audio.save()
 
 
-def write_id3(path: Path, metadata: dict[str, str], cover: bytes | None) -> None:
+def write_id3(
+    path: Path,
+    metadata: dict[str, str],
+    cover: bytes | None,
+    changed_fields: set[str],
+) -> None:
     tags = id3_for(path, create=True)
     assert tags is not None
-    for frame in ("TIT2", "TPE1", "TALB", "TPE2", "TDRC", "TDOR", "TYER", "TORY"):
-        tags.delall(frame)
-    tags.add(TIT2(encoding=3, text=[metadata["TITLE"]]))
-    tags.add(TPE1(encoding=3, text=[metadata["ARTIST"]]))
-    tags.add(TALB(encoding=3, text=[metadata["ALBUM"]]))
-    tags.add(TPE2(encoding=3, text=[metadata["ALBUMARTIST"]]))
-    tags.add(TDRC(encoding=3, text=[metadata["YEAR"]]))
-    tags.add(TDOR(encoding=3, text=[metadata["DATE"]]))
+    frames: dict[str, tuple[tuple[str, ...], Any]] = {
+        "TITLE": (("TIT2",), TIT2),
+        "ARTIST": (("TPE1",), TPE1),
+        "ALBUM": (("TALB",), TALB),
+        "ALBUMARTIST": (("TPE2",), TPE2),
+        "YEAR": (("TDRC", "TYER"), TDRC),
+        "DATE": (("TDOR", "TORY"), TDOR),
+    }
+    for field in changed_fields:
+        frame_names, frame_class = frames[field]
+        for frame_name in frame_names:
+            tags.delall(frame_name)
+        if metadata[field]:
+            tags.add(frame_class(encoding=3, text=[metadata[field]]))
     if cover is not None:
         tags.delall("APIC")
         tags.add(
@@ -1526,42 +1887,74 @@ def write_id3(path: Path, metadata: dict[str, str], cover: bytes | None) -> None
     tags.save(path, v2_version=4)
 
 
-def write_mp4(path: Path, metadata: dict[str, str], cover: bytes | None) -> None:
+def write_mp4(
+    path: Path,
+    metadata: dict[str, str],
+    cover: bytes | None,
+    changed_fields: set[str],
+) -> None:
     audio = MP4(path)
     if audio.tags is None:
         audio.add_tags()
-    for key in ("\xa9nam", "\xa9ART", "\xa9alb", "aART", "\xa9day"):
+    keys = {
+        "TITLE": "\xa9nam",
+        "ARTIST": "\xa9ART",
+        "ALBUM": "\xa9alb",
+        "ALBUMARTIST": "aART",
+    }
+    for field, key in keys.items():
+        if field not in changed_fields:
+            continue
         audio.tags.pop(key, None)
-    audio.tags["\xa9nam"] = [metadata["TITLE"]]
-    audio.tags["\xa9ART"] = [metadata["ARTIST"]]
-    audio.tags["\xa9alb"] = [metadata["ALBUM"]]
-    audio.tags["aART"] = [metadata["ALBUMARTIST"]]
-    audio.tags["\xa9day"] = [metadata["DATE"]]
+        if metadata[field]:
+            audio.tags[key] = [metadata[field]]
+    if changed_fields.intersection({"YEAR", "DATE"}):
+        audio.tags.pop("\xa9day", None)
+        value = metadata["DATE"] or metadata["YEAR"]
+        if value:
+            audio.tags["\xa9day"] = [value]
     if cover is not None:
         audio.tags["covr"] = [MP4Cover(cover, imageformat=MP4Cover.FORMAT_JPEG)]
     audio.save()
 
 
-def write_temp_file(temp: Path, kind: str, metadata: dict[str, str], cover: bytes | None) -> None:
+def write_temp_file(
+    temp: Path,
+    kind: str,
+    metadata: dict[str, str],
+    cover: bytes | None,
+    changed_fields: set[str],
+) -> None:
     if kind == "FLAC":
-        write_flac(temp, metadata, cover)
+        write_flac(temp, metadata, cover, changed_fields)
     elif kind in {"MP3", "AAC"}:
-        write_id3(temp, metadata, cover)
+        write_id3(temp, metadata, cover, changed_fields)
     elif kind == "MP4":
-        write_mp4(temp, metadata, cover)
+        write_mp4(temp, metadata, cover, changed_fields)
     else:
         raise ValueError(f"cover writing is not supported for {kind}")
 
 
-def verify_temp_file(temp: Path, expected_type: str, metadata: dict[str, str], expect_cover: bool) -> dict[str, Any]:
+def verify_temp_file(
+    temp: Path,
+    expected_type: str,
+    metadata_before: dict[str, str],
+    metadata_after: dict[str, str],
+    changed_fields: set[str],
+    expect_cover: bool,
+) -> dict[str, Any]:
     audio = open_audio(temp)
     if audio is None or type(audio).__name__ != expected_type:
         raise ValueError(
             f"type changed: expected {expected_type}, got {type(audio).__name__ if audio else None}"
         )
     actual = read_metadata(temp, audio)
-    if actual != metadata:
-        raise ValueError(f"metadata mismatch: {actual!r} != {metadata!r}")
+    for field in CORE_FIELDS:
+        expected = metadata_after[field] if field in changed_fields else metadata_before[field]
+        if actual[field] != expected:
+            raise ValueError(
+                f"metadata mismatch for {field}: {actual[field]!r} != {expected!r}"
+            )
     cover, mime, count = read_cover(temp, audio)
     if expect_cover and not cover:
         raise ValueError("embedded cover could not be read back")
@@ -1579,9 +1972,131 @@ def verify_temp_file(temp: Path, expected_type: str, metadata: dict[str, str], e
 
 
 def metadata_valid(metadata: dict[str, str]) -> bool:
-    return all(metadata.get(field) for field in CORE_FIELDS) and bool(
-        DATE_RE.match(metadata["DATE"])
-    ) and metadata["YEAR"] == metadata["DATE"][:4]
+    return (
+        all(metadata.get(field) for field in CORE_FIELDS)
+        and valid_release_date(metadata["DATE"])
+        and bool(re.fullmatch(r"(?:19|20)\d{2}", metadata["YEAR"]))
+        and metadata["YEAR"] == metadata["DATE"][:4]
+    )
+
+
+def metadata_missing_fields(metadata: dict[str, str]) -> list[str]:
+    names = {
+        "TITLE": "标题",
+        "ARTIST": "艺术家",
+        "ALBUM": "唱片集",
+        "ALBUMARTIST": "唱片集艺术家",
+        "YEAR": "年份",
+        "DATE": "日期",
+    }
+    missing = [names[field] for field in CORE_FIELDS if not metadata.get(field)]
+    if metadata.get("YEAR") and not re.fullmatch(r"(?:19|20)\d{2}", metadata["YEAR"]):
+        missing.append("有效年份")
+    if metadata.get("DATE") and not valid_release_date(metadata["DATE"]):
+        missing.append("有效日期")
+    elif metadata.get("YEAR") and metadata.get("DATE") and metadata["YEAR"] != metadata["DATE"][:4]:
+        missing.append("年份与日期一致")
+    return missing
+
+
+def update_plan_action(plan: dict[str, Any]) -> None:
+    plan["action"] = "skip"
+    if plan["type"] == "ASF":
+        plan["skip_reason"] = "WMA/ASF 暂不支持安全写入"
+    elif plan.get("metadata_changes"):
+        plan["action"] = "write"
+        plan["skip_reason"] = None
+    elif plan.get("cover_data"):
+        missing = metadata_missing_fields(plan["target_metadata"])
+        plan["skip_reason"] = (
+            "仍缺：" + "、".join(missing) + "；当前没有可写入的新内容"
+            if missing
+            else "当前信息和封面无需修改"
+        )
+    elif plan.get("cover_ready") and plan.get("cover_path"):
+        plan["action"] = "write"
+        plan["skip_reason"] = None
+    else:
+        missing = metadata_missing_fields(plan["target_metadata"])
+        plan["skip_reason"] = (
+            "仍缺：" + "、".join(missing) + "；且未找到可靠封面"
+            if missing
+            else "未找到可靠封面，信息无需修改"
+        )
+
+
+def apply_manual_metadata_to_plan(
+    plan: dict[str, Any], target: dict[str, str]
+) -> None:
+    normalized_target = normalize_metadata_dates(target)
+    previous_target = plan.get("target_metadata") or plan["metadata"]
+    invalidates_candidate = (
+        not plan.get("cover_data")
+        and plan.get("cover_path")
+        and (
+            previous_target.get("ARTIST") != normalized_target["ARTIST"]
+            or (
+                plan.get("cover_kind") == "album-cover"
+                and previous_target.get("ALBUM") != normalized_target["ALBUM"]
+            )
+        )
+    )
+    if invalidates_candidate:
+        plan["cover_source"] = None
+        plan["cover_kind"] = None
+        plan["cover_path"] = None
+        plan["cover_image"] = None
+        plan["artist_photo_candidate"] = None
+        plan["artist_photo_choices"] = []
+        plan["artist_photo_index"] = 0
+        plan["artist_photo_pending"] = False
+        plan["artist_photo_approved"] = False
+        plan["cover_ready"] = False
+    plan["target_metadata"] = normalized_target
+    plan["metadata_source"] = "manual"
+    plan["metadata_changes"] = {
+        field: {
+            "before": plan["metadata"][field],
+            "after": plan["target_metadata"][field],
+        }
+        for field in CORE_FIELDS
+        if plan["metadata"][field] != plan["target_metadata"][field]
+    }
+    plan["metadata_ready"] = metadata_valid(plan["target_metadata"])
+    update_plan_action(plan)
+
+
+def clear_manual_override_plan(plan: dict[str, Any]) -> None:
+    apply_manual_metadata_to_plan(plan, plan["metadata"])
+    plan["metadata_source"] = "existing"
+
+
+def manual_plan_from_track(
+    track: dict[str, Any], target: dict[str, str]
+) -> dict[str, Any]:
+    plan = {
+        **track,
+        "target_metadata": dict(track["metadata"]),
+        "metadata_source": "manual",
+        "metadata_changes": {},
+        "metadata_ready": metadata_valid(track["metadata"]),
+        "catalog": None,
+        "track_catalog": None,
+        "cover_source": "existing-embedded" if track.get("cover_data") else None,
+        "cover_kind": "album-cover" if track.get("cover_data") else None,
+        "cover_path": None,
+        "cover_image": None,
+        "artist_photo_candidate": None,
+        "artist_photo_choices": [],
+        "artist_photo_index": 0,
+        "artist_photo_pending": False,
+        "artist_photo_approved": False,
+        "cover_ready": bool(track.get("cover_data")),
+        "action": "skip",
+        "skip_reason": None,
+    }
+    apply_manual_metadata_to_plan(plan, target)
+    return plan
 
 
 def build_plans(tracks: list[dict[str, Any]], reviewed: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1607,6 +2122,7 @@ def finalize_plans(
     plans: list[dict[str, Any]],
     catalogs: dict[str, dict[str, Any] | None],
     downloads: dict[str, dict[str, Any]],
+    track_catalogs: dict[str, dict[str, Any] | None] | None = None,
 ) -> None:
     local_covers: dict[str, tuple[bytes, str]] = {}
     for plan in plans:
@@ -1621,13 +2137,26 @@ def finalize_plans(
         catalog = catalogs.get(key)
         plan["catalog"] = catalog
         target = plan["target_metadata"]
-        if catalog and not target["DATE"] and DATE_RE.match(catalog.get("release_date") or ""):
+        if (
+            catalog
+            and not target["DATE"]
+            and valid_release_date(catalog.get("release_date") or "")
+        ):
             target["DATE"] = catalog["release_date"]
             target["YEAR"] = target["DATE"][:4]
         if target["DATE"] and not target["YEAR"]:
             target["YEAR"] = target["DATE"][:4]
         if target["YEAR"] and not target["DATE"]:
             target["DATE"] = target["YEAR"]
+        track_catalog = (track_catalogs or {}).get(str(plan["path"]))
+        plan["track_catalog"] = track_catalog
+        if (
+            track_catalog
+            and not target["DATE"]
+            and valid_release_date(track_catalog.get("release_date") or "")
+        ):
+            target["DATE"] = track_catalog["release_date"]
+            target["YEAR"] = target["DATE"][:4]
         if target["ARTIST"]:
             target["ALBUMARTIST"] = target["ARTIST"]
 
@@ -1672,18 +2201,7 @@ def finalize_plans(
                 plan["cover_source"] = catalog["provider"]
                 plan["cover_kind"] = "album-cover"
 
-        plan["action"] = "skip"
-        plan["skip_reason"] = None
-        if not plan["metadata_ready"]:
-            plan["skip_reason"] = "core metadata is still incomplete or invalid"
-        elif plan["type"] == "ASF":
-            plan["skip_reason"] = "ASF/WMA cover writing is intentionally unsupported"
-        elif plan["cover_data"] and not plan["metadata_changes"]:
-            plan["skip_reason"] = "already complete with an embedded cover"
-        elif not plan["cover_ready"] and not plan["metadata_changes"]:
-            plan["skip_reason"] = "no verified album cover was found"
-        else:
-            plan["action"] = "write"
+        update_plan_action(plan)
 
 
 def apply_artist_photo_fallbacks(
@@ -1708,9 +2226,8 @@ def apply_artist_photo_fallbacks(
         plan["cover_kind"] = "artist-photo"
         plan["cover_ready"] = True
         plan["artist_photo_pending"] = True
-        if plan["metadata_ready"]:
-            plan["action"] = "write"
-            plan["skip_reason"] = None
+        plan["action"] = "write"
+        plan["skip_reason"] = None
 
 
 def safe_result_plan(plan: dict[str, Any]) -> dict[str, Any]:
@@ -1720,6 +2237,8 @@ def safe_result_plan(plan: dict[str, Any]) -> dict[str, Any]:
         "type": plan["type"],
         "duration_ms": plan["duration_ms"],
         "metadata_source": plan["metadata_source"],
+        "metadata_complete": bool(plan.get("metadata_ready")),
+        "metadata_missing": metadata_missing_fields(plan["target_metadata"]),
         "metadata_before": plan["metadata"],
         "metadata_after": plan["target_metadata"],
         "metadata_changes": plan["metadata_changes"],
@@ -1734,6 +2253,7 @@ def safe_result_plan(plan: dict[str, Any]) -> dict[str, Any]:
         "artist_photo_pending": bool(plan.get("artist_photo_pending")),
         "artist_photo_approved": bool(plan.get("artist_photo_approved")),
         "catalog": plan["catalog"],
+        "track_catalog": plan.get("track_catalog"),
         "action": plan["action"],
         "skip_reason": plan["skip_reason"],
     }
@@ -1772,6 +2292,14 @@ def apply_plans(
                 progress("write", index, len(writable), plan["filename"])
             continue
 
+        before_audio = open_audio(path)
+        before_duration_ms = (
+            round(before_audio.info.length * 1000)
+            if before_audio is not None
+            and getattr(before_audio.info, "length", None)
+            else None
+        )
+
         rollback["tracks"].append(
             {
                 "path": str(path),
@@ -1806,16 +2334,29 @@ def apply_plans(
                 plan["type"],
                 plan["target_metadata"],
                 cover_bytes,
+                set(plan["metadata_changes"]),
             )
             verified = verify_temp_file(
                 temp,
                 plan["type"],
+                plan["metadata"],
                 plan["target_metadata"],
+                set(plan["metadata_changes"]),
                 expect_cover=bool(
                     plan["cover_data"]
                     or (plan["cover_path"] and use_candidate_cover)
                 ),
             )
+            after_duration_ms = verified.get("duration_ms")
+            if (
+                before_duration_ms is not None
+                and after_duration_ms is not None
+                and abs(before_duration_ms - after_duration_ms) > 50
+            ):
+                raise ValueError(
+                    "audio duration changed after tag writing: "
+                    f"{before_duration_ms} != {after_duration_ms}"
+                )
             os.replace(temp, path)
             results.append(
                 {
@@ -1884,15 +2425,7 @@ def common_parent(paths: list[Path]) -> Path:
         return paths[0].resolve().parent
 
 
-def prepare_selected_files(
-    paths: list[Path],
-    workers: int = 4,
-    progress: ProgressCallback | None = None,
-) -> dict[str, Any]:
-    paths = [path.resolve() for path in paths if path.is_file()]
-    if not paths:
-        raise ValueError("没有可处理的音乐文件")
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+def create_run_dir() -> Path:
     RECORD_DIR.mkdir(parents=True, exist_ok=True)
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
     run_dir = RECORD_DIR / run_id
@@ -1901,36 +2434,13 @@ def prepare_selected_files(
         run_dir = RECORD_DIR / f"{run_id}-{suffix}"
         suffix += 1
     run_dir.mkdir(parents=True)
+    return run_dir
 
-    print(f"扫描 {len(paths)} 个已选择文件……", flush=True)
-    tracks, scan_errors = scan_paths(paths, progress=progress, phase="scan")
-    if not tracks:
-        raise ValueError("没有识别到受支持的音乐文件")
-    reviewed = load_reviewed_seed()
-    plans = build_plans(tracks, reviewed)
-    print(
-        f"识别到 {len(tracks)} 首音乐，已有封面 {sum(track['cover_count'] > 0 for track in tracks)} 首。",
-        flush=True,
-    )
-    catalogs = resolve_catalogs(plans, reviewed, workers, progress=progress)
-    url_labels = {
-        catalog["artwork_url"]: plan["filename"]
-        for plan in plans
-        if (catalog := catalogs.get(album_key(plan["target_metadata"])))
-        and catalog.get("artwork_url")
-    }
-    downloads = download_catalog_covers(
-        catalogs,
-        workers,
-        progress=progress,
-        url_labels=url_labels,
-    )
-    finalize_plans(plans, catalogs, downloads)
-    artist_photos = resolve_artist_photo_fallbacks(
-        plans, workers, progress=progress
-    )
-    apply_artist_photo_fallbacks(plans, artist_photos)
-    preview = {
+
+def preview_payload(
+    paths: list[Path], plans: list[dict[str, Any]], scan_errors: list[dict[str, str]]
+) -> dict[str, Any]:
+    return {
         "created_at": now_iso(),
         "mode": "preview",
         "selected_files": len(paths),
@@ -1943,6 +2453,86 @@ def prepare_selected_files(
         "metadata_ready": sum(plan["metadata_ready"] for plan in plans),
         "plans": [safe_result_plan(plan) for plan in plans],
     }
+
+
+def prepare_manual_files(
+    tracks: list[dict[str, Any]], manual_overrides: dict[str, dict[str, str]]
+) -> dict[str, Any]:
+    selected_tracks = [
+        track for track in tracks if str(track["path"]) in manual_overrides
+    ]
+    if not selected_tracks:
+        raise ValueError("没有可手动处理的曲目")
+    paths = [track["path"].resolve() for track in selected_tracks]
+    plans = [
+        manual_plan_from_track(track, manual_overrides[str(track["path"])])
+        for track in selected_tracks
+    ]
+    run_dir = create_run_dir()
+    preview = preview_payload(paths, plans, [])
+    json_write(run_dir / "执行预览.json", preview)
+    return {
+        "paths": paths,
+        "plans": plans,
+        "run_dir": run_dir,
+        "common_root": common_parent(paths),
+        "preview": preview,
+    }
+
+
+def prepare_selected_files(
+    paths: list[Path],
+    workers: int = 4,
+    progress: ProgressCallback | None = None,
+    manual_overrides: dict[str, dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    paths = [path.resolve() for path in paths if path.is_file()]
+    if not paths:
+        raise ValueError("没有可处理的音乐文件")
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    run_dir = create_run_dir()
+
+    print(f"扫描 {len(paths)} 个已选择文件……", flush=True)
+    tracks, scan_errors = scan_paths(paths, progress=progress, phase="scan")
+    if not tracks:
+        raise ValueError("没有识别到受支持的音乐文件")
+    reviewed = load_reviewed_seed()
+    plans = build_plans(tracks, reviewed)
+    manual_overrides = manual_overrides or {}
+    for plan in plans:
+        override = manual_overrides.get(str(plan["path"]))
+        if override is not None:
+            apply_manual_metadata_to_plan(plan, override)
+    print(
+        f"识别到 {len(tracks)} 首音乐，已有封面 {sum(track['cover_count'] > 0 for track in tracks)} 首。",
+        flush=True,
+    )
+    catalogs = resolve_catalogs(plans, reviewed, workers, progress=progress)
+    track_catalogs = resolve_track_catalogs(
+        plans, catalogs, workers, progress=progress
+    )
+    url_labels = {
+        catalog["artwork_url"]: plan["filename"]
+        for plan in plans
+        if (catalog := catalogs.get(album_key(plan["target_metadata"])))
+        and catalog.get("artwork_url")
+    }
+    downloads = download_catalog_covers(
+        catalogs,
+        workers,
+        progress=progress,
+        url_labels=url_labels,
+    )
+    finalize_plans(plans, catalogs, downloads, track_catalogs=track_catalogs)
+    artist_photos = resolve_artist_photo_fallbacks(
+        plans, workers, progress=progress
+    )
+    apply_artist_photo_fallbacks(plans, artist_photos)
+    for plan in plans:
+        override = manual_overrides.get(str(plan["path"]))
+        if override is not None:
+            apply_manual_metadata_to_plan(plan, override)
+    preview = preview_payload(paths, plans, scan_errors)
     json_write(run_dir / "执行预览.json", preview)
     print(
         f"预览：可安全处理 {preview['will_write']} 首；"
@@ -2503,6 +3093,7 @@ def gui_main_v2() -> None:
     phase_names = {
         "scan": "读取当前信息",
         "catalog": "联网核对唱片集",
+        "track_catalog": "按曲名核对发行日期",
         "cover": "下载并校验封面",
         "artist_photo": "核对歌手照片",
         "write": "安全写入",
@@ -2538,6 +3129,7 @@ def gui_main_v2() -> None:
             self.local_tracks: dict[str, dict[str, Any]] = {}
             self.prepared: dict[str, Any] | None = None
             self.plan_by_path: dict[str, dict[str, Any]] = {}
+            self.manual_overrides: dict[str, dict[str, str]] = {}
             self.running = False
             self.cover_photo = None
             self.help_window = None
@@ -2554,7 +3146,7 @@ def gui_main_v2() -> None:
             self.current_var = tk.StringVar(value="")
             self.count_var = tk.StringVar(value="0/0")
             self.log_visible = bool(self.settings.get("log_visible", False))
-            self.window.title("音乐信息与专辑封面一键整理 2.9")
+            self.window.title("音乐信息与专辑封面一键整理 3.0")
             geometry = str(self.settings.get("geometry") or "1460x880")
             try:
                 self.window.geometry(geometry)
@@ -2759,6 +3351,7 @@ def gui_main_v2() -> None:
             self.table_frame.columnconfigure(0, weight=1)
             self.tree.bind("<Button-1>", self._tree_click, add="+")
             self.tree.bind("<space>", self._toggle_highlighted)
+            self.tree.bind("<F2>", lambda _event: self._edit_metadata())
             self.tree.bind("<<TreeviewSelect>>", self._show_detail)
 
             ttk.Label(
@@ -2827,6 +3420,10 @@ def gui_main_v2() -> None:
                 self.actions, text="使用说明", command=self._show_help
             )
             self.help_button.pack(side="left", padx=(7, 0))
+            self.edit_metadata_button = ttk.Button(
+                self.actions, text="人工编辑信息…", command=self._edit_metadata
+            )
+            self.edit_metadata_button.pack(side="left", padx=(7, 0))
             self.log_frame = ttk.Frame(self.window, padding=(16, 0, 16, 10))
             self.log_text = tk.Text(
                 self.log_frame,
@@ -2927,6 +3524,7 @@ def gui_main_v2() -> None:
             self.paths.clear()
             self.checked.clear()
             self.local_tracks.clear()
+            self.manual_overrides.clear()
             self._invalidate_preview()
             remembered = remembered or set()
             for path in paths:
@@ -3017,6 +3615,7 @@ def gui_main_v2() -> None:
                 self.recursive_check, self.auto_online_check, self.all_button,
                 self.none_button, self.invert_button, self.missing_metadata_button,
                 self.missing_cover_button, self.remove_button,
+                self.edit_metadata_button,
                 self.preview_button, self.cleanup_button,
             ):
                 widget.configure(state=state)
@@ -3064,6 +3663,32 @@ def gui_main_v2() -> None:
                         values[-1] = "尚未联网"
                         self.tree.item(iid, values=values)
 
+        def _restore_manual_preview(self) -> None:
+            if self.running or self.prepared is not None:
+                return
+            overrides = {
+                text: metadata
+                for text, metadata in self.manual_overrides.items()
+                if self.checked.get(text) and text in self.local_tracks
+            }
+            if not overrides:
+                return
+            try:
+                self.prepared = prepare_manual_files(
+                    list(self.local_tracks.values()), overrides
+                )
+                self._refresh_preview_rows()
+                self._set_busy(False)
+                self._update_summary(
+                    f"人工修改待写入 {self.prepared['preview']['will_write']} 首"
+                )
+            except Exception as exc:
+                self._append_log(f"恢复人工修改预览失败：{exc}")
+
+        def _invalidate_and_restore_manual(self) -> None:
+            self._invalidate_preview()
+            self.window.after_idle(self._restore_manual_preview)
+
         def _set_checked(self, path_text: str, value: bool, invalidate: bool = True) -> None:
             if path_text not in self.paths:
                 return
@@ -3072,7 +3697,7 @@ def gui_main_v2() -> None:
             if self.tree.exists(iid):
                 self.tree.item(iid, image=self.checkbox_on if value else self.checkbox_off)
             if invalidate:
-                self._invalidate_preview()
+                self._invalidate_and_restore_manual()
 
         def _tree_click(self, event: Any) -> None:
             if self.running:
@@ -3096,26 +3721,26 @@ def gui_main_v2() -> None:
                 )
                 if path_text:
                     self._set_checked(path_text, not self.checked.get(path_text, False), invalidate=False)
-            self._invalidate_preview()
+            self._invalidate_and_restore_manual()
             self._update_summary()
             return "break"
 
         def _check_all(self) -> None:
             for text in self.paths:
                 self._set_checked(text, True, invalidate=False)
-            self._invalidate_preview()
+            self._invalidate_and_restore_manual()
             self._update_summary()
 
         def _check_none(self) -> None:
             for text in self.paths:
                 self._set_checked(text, False, invalidate=False)
-            self._invalidate_preview()
+            self._invalidate_and_restore_manual()
             self._update_summary()
 
         def _check_invert(self) -> None:
             for text in self.paths:
                 self._set_checked(text, not self.checked[text], invalidate=False)
-            self._invalidate_preview()
+            self._invalidate_and_restore_manual()
             self._update_summary()
 
         def _apply_smart_selection(self, matches: set[str], label: str) -> None:
@@ -3136,7 +3761,7 @@ def gui_main_v2() -> None:
                     matches |= current
             for text in self.paths:
                 self._set_checked(text, text in matches, invalidate=False)
-            self._invalidate_preview()
+            self._invalidate_and_restore_manual()
             self._update_summary(f"{label} {len(matches)} 首")
 
         def _check_missing_metadata(self) -> None:
@@ -3164,9 +3789,198 @@ def gui_main_v2() -> None:
                     self.paths.pop(path_text, None)
                     self.checked.pop(path_text, None)
                     self.local_tracks.pop(path_text, None)
+                    self.manual_overrides.pop(path_text, None)
                 self.tree.delete(iid)
             self._invalidate_preview()
             self._update_summary()
+
+        def _edit_metadata(self) -> None:
+            selection = self.tree.selection()
+            if len(selection) != 1:
+                messagebox.showinfo(
+                    "请选择一首曲目",
+                    "请先在音乐列表中单击选中一首曲目，再进行人工编辑。",
+                )
+                return
+            iid = selection[0]
+            path_text = next(
+                (
+                    text
+                    for text, path in self.paths.items()
+                    if self._iid(path) == iid
+                ),
+                None,
+            )
+            track = self.local_tracks.get(path_text or "")
+            if path_text is None or track is None:
+                messagebox.showinfo("尚未读取", "这首音乐的当前信息尚未读取完成。")
+                return
+            current = dict(track["metadata"])
+            plan = self.plan_by_path.get(path_text)
+            base = dict(
+                self.manual_overrides.get(path_text)
+                or (plan or {}).get("target_metadata")
+                or current
+            )
+
+            dialog = tk.Toplevel(self.window)
+            dialog.title("人工编辑曲目信息")
+            dialog.transient(self.window)
+            dialog.resizable(True, False)
+            dialog.minsize(570, 390)
+            content = ttk.Frame(dialog, padding=(18, 16, 18, 14))
+            content.grid(row=0, column=0, sticky="nsew")
+            dialog.columnconfigure(0, weight=1)
+            content.columnconfigure(1, weight=1)
+            ttk.Label(
+                content,
+                text=track["filename"],
+                font=("Microsoft YaHei UI", 11, "bold"),
+                wraplength=520,
+            ).grid(row=0, column=0, columnspan=2, sticky="w")
+            ttk.Label(
+                content,
+                text=(
+                    "这里编辑的是待写入值；联网预览已有的可靠结果会带入。"
+                    "留空表示清除该字段，保存后仍需点击“② 写入勾选项”。"
+                ),
+                style="Sub.TLabel",
+                wraplength=530,
+                justify="left",
+            ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(5, 12))
+            labels = {
+                "TITLE": "标题",
+                "ARTIST": "艺术家",
+                "ALBUM": "唱片集",
+                "ALBUMARTIST": "唱片集艺术家",
+                "YEAR": "发行年份",
+                "DATE": "发行日期",
+            }
+            variables: dict[str, Any] = {}
+            for row, field in enumerate(CORE_FIELDS, 2):
+                ttk.Label(content, text=labels[field] + "：").grid(
+                    row=row, column=0, sticky="e", padx=(0, 10), pady=4
+                )
+                variable = tk.StringVar(value=base.get(field) or "")
+                variables[field] = variable
+                entry = ttk.Entry(content, textvariable=variable)
+                entry.grid(row=row, column=1, sticky="ew", pady=4)
+                if field == "TITLE":
+                    entry.focus_set()
+            ttk.Label(
+                content,
+                text="日期格式：YYYY、YYYY-MM 或 YYYY-MM-DD；只填年份时日期会同步为该年份。",
+                style="Sub.TLabel",
+                wraplength=530,
+                justify="left",
+            ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(8, 10))
+            buttons = ttk.Frame(content)
+            buttons.grid(row=9, column=0, columnspan=2, sticky="e")
+            result = {"saved": False}
+
+            def load_current() -> None:
+                for field in CORE_FIELDS:
+                    variables[field].set(current[field])
+
+            def save() -> None:
+                raw = {field: variables[field].get() for field in CORE_FIELDS}
+                try:
+                    target = normalize_metadata_dates(raw)
+                except ValueError as exc:
+                    messagebox.showerror("信息格式有误", str(exc), parent=dialog)
+                    return
+                cleared = [
+                    labels[field]
+                    for field in CORE_FIELDS
+                    if current[field] and not target[field]
+                ]
+                if cleared and not messagebox.askyesno(
+                    "确认清空字段",
+                    "以下已有信息将被清空：\n"
+                    + "、".join(cleared)
+                    + "\n\n是否继续？",
+                    parent=dialog,
+                ):
+                    return
+                if target == current:
+                    self.manual_overrides.pop(path_text, None)
+                    if plan is not None and self.prepared is not None:
+                        clear_manual_override_plan(plan)
+                        self.prepared["preview"] = preview_payload(
+                            self.prepared["paths"], self.prepared["plans"], []
+                        )
+                        json_write(
+                            self.prepared["run_dir"] / "执行预览.json",
+                            self.prepared["preview"],
+                        )
+                    else:
+                        self._invalidate_preview()
+                else:
+                    self.manual_overrides[path_text] = target
+                self._set_checked(path_text, True, invalidate=False)
+                if target != current and plan is not None and self.prepared is not None:
+                    apply_manual_metadata_to_plan(plan, target)
+                    self.prepared["preview"] = preview_payload(
+                        self.prepared["paths"], self.prepared["plans"], []
+                    )
+                    json_write(
+                        self.prepared["run_dir"] / "执行预览.json",
+                        self.prepared["preview"],
+                    )
+                elif target != current:
+                    self.prepared = prepare_manual_files(
+                        list(self.local_tracks.values()),
+                        {path_text: target},
+                    )
+                if self.prepared is not None:
+                    self._refresh_preview_rows()
+                self._set_busy(False)
+                self._update_summary(
+                    (
+                        f"人工修改待写入 {self.prepared['preview']['will_write']} 首"
+                        if self.prepared is not None
+                        else "人工修改已恢复为当前文件信息"
+                    )
+                )
+                result["saved"] = True
+                dialog.destroy()
+
+            ttk.Button(buttons, text="载入当前文件信息", command=load_current).pack(
+                side="left", padx=(0, 18)
+            )
+            ttk.Button(buttons, text="保存为待写入", command=save).pack(side="left")
+            ttk.Button(buttons, text="取消", command=dialog.destroy).pack(
+                side="left", padx=(8, 0)
+            )
+            dialog.bind("<Escape>", lambda _event: dialog.destroy())
+            dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+            dialog.update_idletasks()
+            width = max(600, dialog.winfo_reqwidth())
+            height = dialog.winfo_reqheight()
+            x = self.window.winfo_rootx() + max(
+                0, (self.window.winfo_width() - width) // 2
+            )
+            y = self.window.winfo_rooty() + max(
+                0, (self.window.winfo_height() - height) // 2
+            )
+            dialog.geometry(f"{width}x{height}+{x}+{y}")
+            dialog.grab_set()
+            test_action = os.environ.get("MUSIC_ORGANIZER_UI_TEST_ACTION")
+            if test_action == "manual-dialog":
+                self._ui_manual_dialog = {
+                    "title": dialog.title(),
+                    "fields": list(labels.values()),
+                    "buttons": [
+                        child.cget("text")
+                        for child in buttons.winfo_children()
+                    ],
+                    "size": [width, height],
+                }
+                dialog.after(200, dialog.destroy)
+            elif test_action == "manual-save":
+                variables["ALBUMARTIST"].set(current["ARTIST"] or "人工测试艺术家")
+                dialog.after(200, save)
+            self.window.wait_window(dialog)
 
         def _preview(self) -> None:
             paths = [path for text, path in self.paths.items() if self.checked.get(text)]
@@ -3176,13 +3990,21 @@ def gui_main_v2() -> None:
             self._set_busy(True)
             self.stage_var.set("准备联网核对")
             self.current_var.set("")
+            overrides = {
+                text: dict(metadata)
+                for text, metadata in self.manual_overrides.items()
+                if self.checked.get(text)
+            }
 
             def worker() -> None:
                 writer = QueueWriter(self.events)
                 try:
                     with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
                         prepared = prepare_selected_files(
-                            paths, workers=4, progress=self._progress_callback
+                            paths,
+                            workers=4,
+                            progress=self._progress_callback,
+                            manual_overrides=overrides,
                         )
                     writer.flush()
                     self.events.put(("preview_done", prepared))
@@ -3256,6 +4078,8 @@ def gui_main_v2() -> None:
                 if not answer and not plan["metadata_changes"]:
                     plan["action"] = "skip"
                     plan["skip_reason"] = "artist photo was not approved"
+                elif not answer:
+                    update_plan_action(plan)
             self._show_detail()
             return True
 
@@ -3640,6 +4464,9 @@ def gui_main_v2() -> None:
                     elif event == "local_scan_done":
                         tracks, errors = payload
                         self.local_tracks = {str(track["path"]): track for track in tracks}
+                        for text in list(self.manual_overrides):
+                            if text not in self.local_tracks:
+                                self.manual_overrides.pop(text, None)
                         self._refresh_local_rows()
                         self._set_busy(False)
                         self.stage_var.set("本地扫描完成")
@@ -3648,6 +4475,7 @@ def gui_main_v2() -> None:
                         self._update_summary()
                         if errors:
                             self._append_log(f"有 {len(errors)} 个文件读取失败。")
+                        self._restore_manual_preview()
                         if self.auto_online_var.get() and any(self.checked.values()):
                             self.window.after(150, self._preview)
                     elif event == "preview_done":
@@ -3676,6 +4504,13 @@ def gui_main_v2() -> None:
                         )
                         self.prepared = None
                         self.plan_by_path.clear()
+                        succeeded = {
+                            str(item.get("path"))
+                            for item in result.get("results", [])
+                            if item.get("success") and item.get("path")
+                        }
+                        for text in succeeded:
+                            self.manual_overrides.pop(text, None)
                         self._start_local_scan()
                     elif event == "error":
                         self._append_log(str(payload))
@@ -3720,11 +4555,13 @@ def gui_main_v2() -> None:
 
 3. 可逐曲勾选，也可使用“全选”“全不选”“反选”“勾选信息不完整”和“勾选缺失封面”。智能勾选会排除原勾选时，程序会询问是合并、替换还是取消。
 
-4. 点击表格中的曲目，可在右侧同一详情框查看封面与完整信息；滚轮会让封面和文字一起滚动。歌手照片存在多个有效候选时，可点击“换一张歌手照片”，最终采用当前显示的照片。
+4. 点击表格中的曲目，可在右侧同一详情框查看文件当前实际保存的封面与信息；滚轮会让封面和文字一起滚动。右侧不会把尚未写入的预览信息冒充为文件现有信息。
 
-5. 点击“① 联网核对勾选项”，逐曲核对唱片集资料和正式封面。这一步只生成预览，不修改音乐。
+5. 点击“① 联网核对勾选项”，先按唱片集核对资料和正式封面；唱片集日期没有可靠结果时，再按标题、艺术家、时长和唱片集相似度到曲目级目录核对发行日期。这一步只生成预览，不修改音乐。
 
-6. 确认联网预览后，点击“② 写入勾选项”。如使用歌手照片，二次确认弹窗上半部分会再次显示当前歌曲和照片，可用“上一张”“下一张”切换候选；下方仍用“是”“否”“取消”决定是否写入照片或终止操作。底部会实时显示当前阶段、歌曲名称和完成进度。
+6. 联网仍找不到信息，或需要改正已有信息时，先在列表中选中一首曲目，再点击“人工编辑信息…”（也可按 F2）。可以补填、修改或清空字段；日期格式会校验。保存后内容只是待写入预览，仍不会立即修改音乐。
+
+7. 确认联网或人工预览后，点击“② 写入勾选项”。信息尚未全部补齐并不妨碍写入已经确认的部分字段或封面。如使用歌手照片，二次确认弹窗上半部分会再次显示当前歌曲和照片，可用“上一张”“下一张”切换候选；下方仍用“是”“否”“取消”决定是否写入照片或终止操作。底部会实时显示当前阶段、歌曲名称和完成进度。
 
 整理范围
 
@@ -3738,7 +4575,7 @@ def gui_main_v2() -> None:
 
 安全与记录
 
-写入时会先创建同目录临时文件，写入并复读验证成功后才替换原音乐。
+写入时只改动预览中列出的字段和封面，不会为了补一项而清空其他空白或已有字段；先创建同目录临时文件，逐字段复读验证成功后才替换原音乐。
 
 程序数据保存在 EXE 同级的“音乐整理工具数据”文件夹。移动工具时，将 EXE 和该文件夹放在一起即可保留设置、勾选状态、记录和缓存。
 
@@ -3904,6 +4741,27 @@ def gui_main_v2() -> None:
                     app.detail_text.yview_moveto(1.0)
                     root.update_idletasks()
                     app._ui_detail_yview_bottom = list(app.detail_text.yview())
+            elif ui_test_action in {"manual-dialog", "manual-save"}:
+                first = next(iter(app.tree.get_children()), None)
+                if first:
+                    app.tree.selection_set(first)
+                    app._edit_metadata()
+            elif ui_test_action == "online-preview-real":
+                target = Path(
+                    os.environ["MUSIC_ORGANIZER_UI_TEST_TARGET"]
+                ).resolve()
+                target_text = str(target)
+                if not getattr(app, "_ui_online_preview_started", False):
+                    app._ui_online_preview_started = True
+                    app._check_none()
+                    app._set_checked(target_text, True)
+                    app._preview()
+                    root.after(100, finish_ui_test)
+                    return
+                app._ui_online_plan = app.plan_by_path.get(target_text) or {}
+                if app.tree.exists(app._iid(target)):
+                    app.tree.selection_set(app._iid(target))
+                    app._show_detail()
             elif ui_test_action == "help-dialog":
                 app._show_help()
                 root.update_idletasks()
@@ -3954,6 +4812,16 @@ def gui_main_v2() -> None:
                 messagebox.showwarning = lambda *_args, **_kwargs: None
                 app._clean_logs_and_cache()
             root.update_idletasks()
+            main_screenshot = os.environ.get(
+                "MUSIC_ORGANIZER_UI_TEST_MAIN_SCREENSHOT"
+            )
+            if main_screenshot:
+                from PIL import ImageGrab
+
+                root.update()
+                ImageGrab.grab(
+                    window=root.winfo_id(), include_layered_windows=True
+                ).save(main_screenshot)
             widgets = list(root.winfo_children())
             buttons = []
             checkbuttons = []
@@ -4054,6 +4922,24 @@ def gui_main_v2() -> None:
                     "artist_photo_confirm_action": getattr(
                         app, "_ui_artist_photo_plan", {}
                     ).get("action"),
+                    "manual_dialog": getattr(app, "_ui_manual_dialog", {}),
+                    "manual_override_count": len(app.manual_overrides),
+                    "prepared_will_write": (
+                        (app.prepared or {}).get("preview", {}).get("will_write")
+                    ),
+                    "apply_button_state": str(app.apply_button.cget("state")),
+                    "online_plan": {
+                        "action": getattr(app, "_ui_online_plan", {}).get("action"),
+                        "metadata_after": getattr(
+                            app, "_ui_online_plan", {}
+                        ).get("target_metadata"),
+                        "metadata_changes": getattr(
+                            app, "_ui_online_plan", {}
+                        ).get("metadata_changes"),
+                        "track_catalog": getattr(
+                            app, "_ui_online_plan", {}
+                        ).get("track_catalog"),
+                    },
                     "log_visible": app.log_visible,
                     "data_dir": str(APP_DATA_DIR),
                     "settings_exists": SETTINGS_PATH.is_file(),
@@ -4105,8 +4991,13 @@ def main() -> None:
     )
 
     catalogs = resolve_catalogs(plans, reviewed, args.workers)
+    track_catalogs = resolve_track_catalogs(plans, catalogs, args.workers)
     downloads = download_catalog_covers(catalogs, args.workers)
-    finalize_plans(plans, catalogs, downloads)
+    finalize_plans(
+        plans, catalogs, downloads, track_catalogs=track_catalogs
+    )
+    artist_photos = resolve_artist_photo_fallbacks(plans, args.workers)
+    apply_artist_photo_fallbacks(plans, artist_photos)
 
     preview = {
         "created_at": now_iso(),

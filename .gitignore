@@ -1,4 +1,9 @@
 __pycache__/
+testdeps/
+ui-fixture/
+ui-*.json
+ui-*.png
+packaged-*.json
 *.py[cod]
 .venv/
 .build/
@@ -7,4 +12,3 @@ dist/
 音乐整理工具数据/
 portable/音乐整理工具数据/
 *.log
-
