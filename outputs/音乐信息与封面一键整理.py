@@ -2554,7 +2554,7 @@ def gui_main_v2() -> None:
             self.current_var = tk.StringVar(value="")
             self.count_var = tk.StringVar(value="0/0")
             self.log_visible = bool(self.settings.get("log_visible", False))
-            self.window.title("音乐信息与专辑封面一键整理 2.8")
+            self.window.title("音乐信息与专辑封面一键整理 2.9")
             geometry = str(self.settings.get("geometry") or "1460x880")
             try:
                 self.window.geometry(geometry)
@@ -3259,21 +3259,7 @@ def gui_main_v2() -> None:
             photo_plans = [plan for plan in plans if plan.get("artist_photo_pending")]
             if not photo_plans:
                 return True
-            names = [
-                f"• {plan['filename']}  ←  {plan['target_metadata']['ARTIST']}"
-                for plan in photo_plans[:12]
-            ]
-            if len(photo_plans) > 12:
-                names.append(f"……另有 {len(photo_plans) - 12} 首")
-            answer = messagebox.askyesnocancel(
-                "二次确认：使用歌手照片",
-                "以下曲目没有找到可靠的正式唱片封面，程序找到了歌手照片：\n\n"
-                + "\n".join(names)
-                + "\n\n选择“是”：将预览中的歌手照片写作封面。"
-                "\n选择“否”：不写歌手照片，仍继续写入可补充的曲目信息。"
-                "\n选择“取消”：终止本次写入。",
-                icon="warning",
-            )
+            answer = self._ask_artist_photo_confirmation(photo_plans)
             if answer is None:
                 return False
             for plan in photo_plans:
@@ -3281,7 +3267,249 @@ def gui_main_v2() -> None:
                 if not answer and not plan["metadata_changes"]:
                     plan["action"] = "skip"
                     plan["skip_reason"] = "artist photo was not approved"
+            self._show_detail()
             return True
+
+        def _ask_artist_photo_confirmation(
+            self, photo_plans: list[dict[str, Any]]
+        ) -> bool | None:
+            names = [
+                f"• {plan['filename']}  ←  {plan['target_metadata']['ARTIST']}"
+                for plan in photo_plans[:12]
+            ]
+            if len(photo_plans) > 12:
+                names.append(f"……另有 {len(photo_plans) - 12} 首")
+            selected_plan = self._selected_plan()
+            current_plan = next(
+                (plan for plan in photo_plans if plan is selected_plan), photo_plans[0]
+            )
+            message = (
+                "以下曲目没有找到可靠的正式唱片封面，程序找到了歌手照片：\n\n"
+                + "\n".join(names)
+                + "\n\n选择“是”：将预览中的歌手照片写作封面。"
+                "\n选择“否”：不写歌手照片，仍继续写入可补充的曲目信息。"
+                "\n选择“取消”：终止本次写入。"
+            )
+
+            dialog = tk.Toplevel(self.window)
+            dialog.title("二次确认：使用歌手照片")
+            dialog.transient(self.window)
+            dialog.resizable(False, False)
+            result: dict[str, Any] = {"answer": None, "photo": None}
+
+            content = ttk.Frame(dialog, padding=(18, 16, 18, 14))
+            content.grid(row=0, column=0, sticky="nsew")
+
+            preview = ttk.Frame(content)
+            preview.grid(row=0, column=0, sticky="ew")
+            image_box = tk.Frame(
+                preview,
+                width=300,
+                height=300,
+                background="#f3f4f6",
+                highlightbackground="#c8ccd2",
+                highlightthickness=1,
+            )
+            image_box.grid(row=0, column=0, sticky="nw")
+            image_box.grid_propagate(False)
+            image_label = tk.Label(
+                image_box,
+                text="照片预览不可用",
+                background="#f3f4f6",
+                foreground="#666666",
+                font=("Microsoft YaHei UI", 10),
+            )
+            image_label.place(relx=0.5, rely=0.5, anchor="center")
+
+            preview_side = ttk.Frame(preview, padding=(16, 3, 0, 0), width=250)
+            preview_side.grid(row=0, column=1, sticky="nsew")
+            preview_side.grid_propagate(False)
+            ttk.Label(
+                preview_side,
+                text="当前歌曲",
+                font=("Microsoft YaHei UI", 11, "bold"),
+            ).pack(anchor="w")
+            song_var = tk.StringVar()
+            position_var = tk.StringVar()
+            source_var = tk.StringVar()
+            ttk.Label(
+                preview_side,
+                textvariable=song_var,
+                wraplength=225,
+                justify="left",
+            ).pack(anchor="w", pady=(7, 12))
+            ttk.Label(
+                preview_side,
+                textvariable=position_var,
+                foreground="#555555",
+            ).pack(anchor="w")
+            ttk.Label(
+                preview_side,
+                textvariable=source_var,
+                wraplength=225,
+                foreground="#555555",
+            ).pack(anchor="w", pady=(4, 12))
+            photo_buttons = ttk.Frame(preview_side)
+            photo_buttons.pack(anchor="w")
+            previous_button = ttk.Button(photo_buttons, text="上一张")
+            previous_button.pack(side="left")
+            next_button = ttk.Button(photo_buttons, text="下一张")
+            next_button.pack(side="left", padx=(8, 0))
+
+            ttk.Separator(content, orient="horizontal").grid(
+                row=1, column=0, sticky="ew", pady=(15, 13)
+            )
+            message_row = ttk.Frame(content)
+            message_row.grid(row=2, column=0, sticky="ew")
+            ttk.Label(
+                message_row,
+                text="⚠",
+                font=("Segoe UI Symbol", 25),
+                foreground="#d88700",
+            ).grid(row=0, column=0, sticky="n", padx=(0, 12), pady=(0, 0))
+            ttk.Label(
+                message_row,
+                text=message,
+                wraplength=510,
+                justify="left",
+            ).grid(row=0, column=1, sticky="w")
+
+            button_row = ttk.Frame(content)
+            button_row.grid(row=3, column=0, sticky="e", pady=(15, 0))
+
+            def finish(answer: bool | None) -> None:
+                result["answer"] = answer
+                if dialog.winfo_exists():
+                    try:
+                        dialog.grab_release()
+                    except tk.TclError:
+                        pass
+                    dialog.destroy()
+
+            yes_button = ttk.Button(button_row, text="是", command=lambda: finish(True))
+            no_button = ttk.Button(button_row, text="否", command=lambda: finish(False))
+            cancel_button = ttk.Button(
+                button_row, text="取消", command=lambda: finish(None)
+            )
+            yes_button.pack(side="left")
+            no_button.pack(side="left", padx=(8, 0))
+            cancel_button.pack(side="left", padx=(8, 0))
+
+            def refresh_preview() -> None:
+                choices = current_plan.get("artist_photo_choices") or []
+                index = int(current_plan.get("artist_photo_index") or 0)
+                if choices:
+                    index %= len(choices)
+                    current_plan["artist_photo_index"] = index
+                song_var.set(
+                    f"{current_plan['filename']}\n"
+                    f"艺术家：{current_plan['target_metadata']['ARTIST']}"
+                )
+                position_var.set(
+                    f"第 {index + 1} 张 / 共 {len(choices)} 张"
+                    if choices
+                    else "当前仅有 1 张"
+                )
+                source_var.set(
+                    f"来源：{current_plan.get('cover_source') or '未记录'}"
+                )
+                image_data = None
+                if current_plan.get("cover_path"):
+                    try:
+                        image_data = Path(current_plan["cover_path"]).read_bytes()
+                    except OSError:
+                        pass
+                if image_data is None:
+                    image_data = current_plan.get("cover_data")
+                try:
+                    if not image_data:
+                        raise ValueError("missing image")
+                    with Image.open(io.BytesIO(image_data)) as image:
+                        image = ImageOps.contain(
+                            image.convert("RGB"),
+                            (284, 284),
+                            Image.Resampling.LANCZOS,
+                        )
+                        result["photo"] = ImageTk.PhotoImage(image.copy())
+                    image_label.configure(image=result["photo"], text="")
+                except Exception:
+                    result["photo"] = None
+                    image_label.configure(image="", text="照片预览不可用")
+                button_state = "normal" if len(choices) > 1 else "disabled"
+                previous_button.configure(state=button_state)
+                next_button.configure(state=button_state)
+
+            def change_photo(step: int) -> None:
+                choices = current_plan.get("artist_photo_choices") or []
+                if len(choices) < 2:
+                    return
+                self._select_artist_photo_choice(
+                    current_plan,
+                    int(current_plan.get("artist_photo_index") or 0) + step,
+                )
+                refresh_preview()
+                self._show_detail()
+
+            previous_button.configure(command=lambda: change_photo(-1))
+            next_button.configure(command=lambda: change_photo(1))
+            dialog.protocol("WM_DELETE_WINDOW", lambda: finish(None))
+            dialog.bind("<Escape>", lambda _event: finish(None))
+            dialog.bind("<Return>", lambda _event: finish(True))
+            refresh_preview()
+            dialog.update_idletasks()
+            width = max(620, dialog.winfo_reqwidth())
+            height = dialog.winfo_reqheight()
+            x = self.window.winfo_rootx() + max(
+                0, (self.window.winfo_width() - width) // 2
+            )
+            y = self.window.winfo_rooty() + max(
+                0, (self.window.winfo_height() - height) // 2
+            )
+            dialog.geometry(f"{width}x{height}+{x}+{y}")
+            dialog.grab_set()
+            yes_button.focus_set()
+
+            test_answer = getattr(self, "_artist_photo_dialog_test_answer", "unset")
+            if test_answer != "unset":
+                dialog.after(180, lambda: finish(test_answer))
+            screenshot_path = os.environ.get("MUSIC_ORGANIZER_UI_TEST_SCREENSHOT")
+            if screenshot_path:
+                def capture_dialog() -> None:
+                    from PIL import ImageGrab
+
+                    if os.environ.get("MUSIC_ORGANIZER_UI_TEST_SWITCH_PHOTO") == "1":
+                        change_photo(1)
+                    dialog.update_idletasks()
+                    dialog.update()
+                    screenshot = ImageGrab.grab(
+                        window=dialog.winfo_id(), include_layered_windows=True
+                    )
+                    screenshot.save(screenshot_path)
+                    json_write(
+                        Path(screenshot_path).with_suffix(".json"),
+                        {
+                            "title": dialog.title(),
+                            "size": [dialog.winfo_width(), dialog.winfo_height()],
+                            "candidate_index": int(
+                                current_plan.get("artist_photo_index") or 0
+                            ),
+                            "candidate_count": len(
+                                current_plan.get("artist_photo_choices") or []
+                            ),
+                            "buttons": [
+                                previous_button.cget("text"),
+                                next_button.cget("text"),
+                                yes_button.cget("text"),
+                                no_button.cget("text"),
+                                cancel_button.cget("text"),
+                            ],
+                        },
+                    )
+                    finish(None)
+
+                dialog.after(650, capture_dialog)
+            self.window.wait_window(dialog)
+            return result["answer"]
 
         def _refresh_local_rows(self) -> None:
             for text, path in self.paths.items():
@@ -3435,16 +3663,25 @@ def gui_main_v2() -> None:
             choices = plan.get("artist_photo_choices") or []
             if len(choices) < 2:
                 return
-            next_index = (int(plan.get("artist_photo_index") or 0) + 1) % len(choices)
-            selected = choices[next_index]
+            self._select_artist_photo_choice(
+                plan, int(plan.get("artist_photo_index") or 0) + 1
+            )
+            self._show_detail()
+
+        @staticmethod
+        def _select_artist_photo_choice(plan: dict[str, Any], index: int) -> None:
+            choices = plan.get("artist_photo_choices") or []
+            if not choices:
+                return
+            selected_index = index % len(choices)
+            selected = choices[selected_index]
             candidate = selected["candidate"]
-            plan["artist_photo_index"] = next_index
+            plan["artist_photo_index"] = selected_index
             plan["artist_photo_candidate"] = candidate
             plan["cover_path"] = selected["path"]
             plan["cover_image"] = selected["image"]
             plan["cover_source"] = candidate.get("provider") or "artist-photo"
             plan["artist_photo_approved"] = False
-            self._show_detail()
 
         def _poll_events(self) -> None:
             try:
@@ -3549,13 +3786,13 @@ def gui_main_v2() -> None:
 
 5. 点击“① 联网核对勾选项”，逐曲核对唱片集资料和正式封面。这一步只生成预览，不修改音乐。
 
-6. 确认联网预览后，点击“② 写入勾选项”。底部会实时显示当前阶段、歌曲名称和完成进度。
+6. 确认联网预览后，点击“② 写入勾选项”。如使用歌手照片，二次确认弹窗上半部分会再次显示当前歌曲和照片，可用“上一张”“下一张”切换候选；下方仍用“是”“否”“取消”决定是否写入照片或终止操作。底部会实时显示当前阶段、歌曲名称和完成进度。
 
 整理范围
 
 只补充或纠正标题、艺术家、唱片集、唱片集艺术家、发行年份和发行日期。唱片集艺术家统一写成与参与创作的艺术家相同。
 
-已有封面默认保留。缺少封面时，优先采用经唱片集、艺术家和发行信息核对的正式封面。正式封面找不到时，可显示与公开音乐目录主歌手名或 Wikipedia 人物页标题严格匹配的歌手照片；相同画面的不同尺寸和裁切会自动合并。存在多张有效候选时可使用“换一张歌手照片”，但必须在写入前再次确认；拒绝后封面保持空白。程序不生成或猜测图片。
+已有封面默认保留。缺少封面时，优先采用经唱片集、艺术家和发行信息核对的正式封面。正式封面找不到时，可显示与公开音乐目录主歌手名或 Wikipedia 人物页标题严格匹配的歌手照片；相同画面的不同尺寸和裁切会自动合并。存在多张有效候选时可在主界面切换，也可在二次确认弹窗中使用“上一张”“下一张”；选择“是”才写入照片，拒绝后封面保持空白。程序不生成或猜测图片。
 
 文件格式
 
@@ -3735,9 +3972,10 @@ def gui_main_v2() -> None:
             elif ui_test_action.startswith("artist-photo-confirm:"):
                 answer_text = ui_test_action.partition(":")[2]
                 answer = {"yes": True, "no": False, "cancel": None}[answer_text]
-                messagebox.askyesnocancel = lambda *_args, **_kwargs: answer
+                app._artist_photo_dialog_test_answer = answer
                 app._ui_artist_photo_plan = {
                     "filename": "测试曲目.flac",
+                    "path": Path("测试曲目.flac"),
                     "target_metadata": {"ARTIST": "测试歌手"},
                     "artist_photo_pending": True,
                     "artist_photo_approved": False,
@@ -3748,6 +3986,30 @@ def gui_main_v2() -> None:
                 app._ui_artist_photo_continue = app._confirm_artist_photos(
                     [app._ui_artist_photo_plan]
                 )
+            elif ui_test_action == "artist-photo-confirm-real":
+                target = Path(
+                    os.environ["MUSIC_ORGANIZER_UI_TEST_TARGET"]
+                ).resolve()
+                target_text = str(target)
+                if not getattr(app, "_ui_real_preview_started", False):
+                    if target_text not in app.paths:
+                        raise RuntimeError("实验曲目不在当前扫描范围内")
+                    app._ui_real_preview_started = True
+                    app._check_none()
+                    app._set_checked(target_text, True)
+                    app._preview()
+                    root.after(100, finish_ui_test)
+                    return
+                plans = [
+                    plan
+                    for plan in (app.prepared or {}).get("plans", [])
+                    if Path(plan["path"]).resolve() == target
+                    and plan.get("artist_photo_pending")
+                ]
+                if len(plans) != 1:
+                    raise RuntimeError("实验曲目没有得到唯一的歌手照片预览")
+                app._ui_artist_photo_plan = plans[0]
+                app._ui_artist_photo_continue = app._confirm_artist_photos(plans)
             elif ui_test_action == "artist-photo-switch":
                 first = next(iter(app.tree.get_children()), None)
                 if first:
