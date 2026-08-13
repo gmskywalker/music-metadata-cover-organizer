@@ -2761,20 +2761,11 @@ def gui_main_v2() -> None:
             self.tree.bind("<space>", self._toggle_highlighted)
             self.tree.bind("<<TreeviewSelect>>", self._show_detail)
 
-            detail_header = ttk.Frame(detail_frame)
-            detail_header.pack(fill="x")
             ttk.Label(
-                detail_header,
+                detail_frame,
                 text="曲目信息",
                 font=("Microsoft YaHei UI", 11, "bold"),
-            ).pack(side="left")
-            self.next_artist_photo_button = ttk.Button(
-                detail_header,
-                text="换一张歌手照片",
-                command=self._next_artist_photo,
-                state="disabled",
-            )
-            self.next_artist_photo_button.pack(side="right")
+            ).pack(anchor="w")
             detail_content = ttk.Frame(detail_frame)
             detail_content.pack(fill="both", expand=True, pady=(10, 0))
             self.detail_text = tk.Text(
@@ -3026,11 +3017,9 @@ def gui_main_v2() -> None:
                 self.recursive_check, self.auto_online_check, self.all_button,
                 self.none_button, self.invert_button, self.missing_metadata_button,
                 self.missing_cover_button, self.remove_button,
-                self.preview_button, self.cleanup_button, self.next_artist_photo_button,
+                self.preview_button, self.cleanup_button,
             ):
                 widget.configure(state=state)
-            if not busy:
-                self._update_artist_photo_button()
             writable = bool(
                 self.prepared
                 and any(plan["action"] == "write" for plan in self.prepared["plans"])
@@ -3570,7 +3559,6 @@ def gui_main_v2() -> None:
             if path is None:
                 return
             track = self.local_tracks.get(str(path))
-            plan = self.plan_by_path.get(str(path))
             lines = [f"文件：{path.name}", f"路径：{path}", ""]
             image_data = None
             if track:
@@ -3586,29 +3574,6 @@ def gui_main_v2() -> None:
                     f"封面：{'已有' if track['cover_count'] else '无'}",
                 ])
                 image_data = track.get("cover_data")
-            if plan:
-                meta = plan["target_metadata"]
-                choices = plan.get("artist_photo_choices") or []
-                photo_position = (
-                    f"（第 {int(plan.get('artist_photo_index') or 0) + 1} 张 / 共 {len(choices)} 张）"
-                    if plan.get("artist_photo_pending") and choices
-                    else ""
-                )
-                lines.extend([
-                    "", "【联网核对后】",
-                    f"标题：{meta['TITLE']}", f"艺术家：{meta['ARTIST']}",
-                    f"唱片集：{meta['ALBUM']}", f"唱片集艺术家：{meta['ALBUMARTIST']}",
-                    f"年份：{meta['YEAR']}", f"日期：{meta['DATE']}",
-                    f"封面：{'保留原封面' if plan['cover_data'] else '歌手照片（待二次确认）' + photo_position if plan.get('artist_photo_pending') else '已找到正式封面' if plan['cover_ready'] else '未找到可靠正式封面或歌手照片'}",
-                    f"封面来源：{plan.get('cover_source') or '未找到'}",
-                    f"动作：{'可安全写入' if plan['action'] == 'write' else plan.get('skip_reason') or '跳过'}",
-                ])
-                image_data = plan.get("cover_data")
-                if image_data is None and plan.get("cover_path"):
-                    try:
-                        image_data = plan["cover_path"].read_bytes()
-                    except OSError:
-                        image_data = None
             self.detail_text.configure(state="normal")
             self.detail_text.delete("1.0", "end")
             if image_data:
@@ -3630,7 +3595,6 @@ def gui_main_v2() -> None:
             self.detail_text.insert("end", "\n".join(lines))
             self.detail_text.yview_moveto(0.0)
             self.detail_text.configure(state="disabled")
-            self._update_artist_photo_button()
 
         def _selected_plan(self) -> dict[str, Any] | None:
             selection = self.tree.selection()
@@ -3641,32 +3605,6 @@ def gui_main_v2() -> None:
                 (path for path in self.paths.values() if self._iid(path) == iid), None
             )
             return self.plan_by_path.get(str(path)) if path is not None else None
-
-        def _update_artist_photo_button(self) -> None:
-            if not hasattr(self, "next_artist_photo_button"):
-                return
-            plan = self._selected_plan()
-            enabled = bool(
-                not self.running
-                and plan
-                and plan.get("artist_photo_pending")
-                and len(plan.get("artist_photo_choices") or []) > 1
-            )
-            self.next_artist_photo_button.configure(
-                state="normal" if enabled else "disabled"
-            )
-
-        def _next_artist_photo(self) -> None:
-            plan = self._selected_plan()
-            if not plan or not plan.get("artist_photo_pending"):
-                return
-            choices = plan.get("artist_photo_choices") or []
-            if len(choices) < 2:
-                return
-            self._select_artist_photo_choice(
-                plan, int(plan.get("artist_photo_index") or 0) + 1
-            )
-            self._show_detail()
 
         @staticmethod
         def _select_artist_photo_choice(plan: dict[str, Any], index: int) -> None:
@@ -4010,62 +3948,6 @@ def gui_main_v2() -> None:
                     raise RuntimeError("实验曲目没有得到唯一的歌手照片预览")
                 app._ui_artist_photo_plan = plans[0]
                 app._ui_artist_photo_continue = app._confirm_artist_photos(plans)
-            elif ui_test_action == "artist-photo-switch":
-                first = next(iter(app.tree.get_children()), None)
-                if first:
-                    app.tree.selection_set(first)
-                    path = next(
-                        path
-                        for path in app.paths.values()
-                        if app._iid(path) == first
-                    )
-                    track = app.local_tracks[str(path)]
-                    image_data = track.get("cover_data")
-                    if image_data:
-                        test_dir = APP_DATA_DIR / "_界面测试"
-                        test_dir.mkdir(parents=True, exist_ok=True)
-                        first_path = test_dir / "歌手照片候选1.jpg"
-                        second_path = test_dir / "歌手照片候选2.jpg"
-                        normalized_image, image_metadata = normalize_cover_image(image_data)
-                        first_path.write_bytes(normalized_image)
-                        second_path.write_bytes(normalized_image)
-                        app._ui_artist_photo_temp_dir = test_dir
-                        app._ui_artist_photo_plan = {
-                            "target_metadata": dict(track["metadata"]),
-                            "cover_data": None,
-                            "cover_path": first_path,
-                            "cover_image": image_metadata,
-                            "cover_ready": True,
-                            "cover_source": "candidate-one",
-                            "cover_kind": "artist-photo",
-                            "artist_photo_candidate": {"provider": "candidate-one"},
-                            "artist_photo_choices": [
-                                {
-                                    "candidate": {"provider": "candidate-one"},
-                                    "path": first_path,
-                                    "image": image_metadata,
-                                },
-                                {
-                                    "candidate": {"provider": "candidate-two"},
-                                    "path": second_path,
-                                    "image": image_metadata,
-                                },
-                            ],
-                            "artist_photo_index": 0,
-                            "artist_photo_pending": True,
-                            "artist_photo_approved": False,
-                            "metadata_changes": {},
-                            "action": "write",
-                            "skip_reason": None,
-                        }
-                        app.plan_by_path[str(path)] = app._ui_artist_photo_plan
-                        app._show_detail()
-                        root.update_idletasks()
-                        app._ui_artist_photo_button_before = str(
-                            app.next_artist_photo_button.cget("state")
-                        )
-                        app._next_artist_photo()
-                        root.update_idletasks()
             elif ui_test_action == "cleanup-confirm":
                 messagebox.askyesno = lambda *_args, **_kwargs: True
                 messagebox.showinfo = lambda *_args, **_kwargs: None
@@ -4172,21 +4054,6 @@ def gui_main_v2() -> None:
                     "artist_photo_confirm_action": getattr(
                         app, "_ui_artist_photo_plan", {}
                     ).get("action"),
-                    "artist_photo_switch_button_before": getattr(
-                        app, "_ui_artist_photo_button_before", ""
-                    ),
-                    "artist_photo_switch_index": getattr(
-                        app, "_ui_artist_photo_plan", {}
-                    ).get("artist_photo_index"),
-                    "artist_photo_switch_source": getattr(
-                        app, "_ui_artist_photo_plan", {}
-                    ).get("cover_source"),
-                    "artist_photo_switch_path": str(
-                        getattr(app, "_ui_artist_photo_plan", {}).get("cover_path")
-                        or ""
-                    ),
-                    "artist_photo_switch_position_visible": "第 2 张 / 共 2 张"
-                    in app.detail_text.get("1.0", "end"),
                     "log_visible": app.log_visible,
                     "data_dir": str(APP_DATA_DIR),
                     "settings_exists": SETTINGS_PATH.is_file(),
